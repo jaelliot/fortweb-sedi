@@ -744,6 +744,262 @@ test("public identifier export and import survive vault and worker restarts", as
     }
 });
 
+test("independent workers cannot write the same wallet concurrently", async ({ page, baseURL }, testInfo) => {
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    const second = await page.context().newPage();
+    await page.context().route("**/app/runtime/wallet-worker.py", async (route) => {
+        const response = await route.fetch();
+        const source = await response.text();
+        expect(source).toContain("    if method.startswith(\"kf.\"):");
+        await route.fulfill({ response, body: source
+            .replace('    "vaults.list",', '    "test.interact",\n    "vaults.list",')
+            .replace('    if method.startswith("kf."):', `    if method == "test.interact":
+        state = vaulting.require_open_state(params["vaultId"])
+        hab = state["hby"].habByName("first")
+        hab.interact(data=[], version=_load_modules()["kering"].Vrsn_2_0, gvrsn=_load_modules()["kering"].Vrsn_2_0)
+        return {"sn": hab.kever.sn, "said": hab.kever.serder.said}
+    if method.startswith("kf."):`) });
+    });
+    const boot = async (target: Page) => {
+        const started = target.waitForEvent("worker", { timeout: PHASE_TIMEOUT_MS });
+        await target.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+        await target.waitForFunction(() => (
+            window as typeof window & { webbaserProductionHarnessReady?: boolean }
+        ).webbaserProductionHarnessReady === true);
+        return started;
+    };
+    const request = (target: Page, method: string, params: Record<string, unknown> = {}) => target.evaluate(
+        ({ method, params }) => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request(method, params), { method, params },
+    );
+    try {
+        const firstWorker = await boot(page);
+        await boot(second);
+        const created = await request(page, "vaults.create", { name: uniqueName("writer"), passcode: "" });
+        const vaultId = String((created.vault as Record<string, unknown>).id);
+        await request(page, "vaults.open", { vaultId, passcode: "" });
+        const heldLocks = await page.evaluate(async () => (await navigator.locks.query()).held?.map((lock) => lock.name));
+        expect(heldLocks).toContain("@fortweb-v2/writer");
+        await expect(request(second, "vaults.open", { vaultId, passcode: "" })).rejects.toThrow(/already open/);
+        await expect(request(second, "identifiers.create", { vaultId, alias: "blocked" })).rejects.toThrow(/already open/);
+        await expect(request(second, "test.interact", { vaultId })).rejects.toThrow(/already open/);
+        const first = await request(page, "identifiers.create", { vaultId, alias: "first" });
+        const firstAid = String((first.identifier as Record<string, unknown>).aid);
+        expect((await request(page, "test.interact", { vaultId })).sn).toBe(1);
+        await request(page, "vaults.close", { vaultId });
+        await request(second, "vaults.open", { vaultId, passcode: "" });
+        expect((await request(second, "identifiers.get", { vaultId, aid: firstAid })).identifier)
+            .toEqual(expect.objectContaining({ aid: firstAid }));
+        expect((await request(second, "test.interact", { vaultId })).sn).toBe(2);
+        await request(second, "identifiers.create", { vaultId, alias: "second" });
+        await request(second, "vaults.close", { vaultId });
+        await request(page, "vaults.open", { vaultId, passcode: "" });
+        const closed = firstWorker.waitForEvent("close", { timeout: PHASE_TIMEOUT_MS });
+        await page.evaluate(() => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.destroy());
+        await closed;
+        await expect.poll(async () => {
+            try {
+                await request(second, "vaults.open", { vaultId, passcode: "" });
+                return true;
+            } catch {
+                return false;
+            }
+        }, { timeout: PHASE_TIMEOUT_MS }).toBe(true);
+        const list = await request(second, "identifiers.list", { vaultId });
+        const aliases = (list.identifiers as Array<Record<string, unknown>>).map((row) => row.alias);
+        expect(aliases).toContain("second");
+        expect(aliases).toContain("first");
+        const continuation = await request(second, "test.interact", { vaultId });
+        expect(continuation.sn).toBe(3);
+        const exported = await request(second, "identifiers.export", { vaultId, aid: firstAid });
+        writeFileSync(testInfo.outputPath("concurrent-writer-kel.cesr"), Buffer.from(String(exported.cesr), "base64"));
+        writeFileSync(testInfo.outputPath("concurrent-writer-kel.json"), JSON.stringify({ aid: firstAid, ...continuation }));
+        await request(second, "vaults.close", { vaultId });
+    } finally {
+        await second.close();
+    }
+});
+
+test("legacy and protected workers keep fresh identities in separate storage", async ({ page, baseURL }, testInfo) => {
+    const legacyRoot = process.env["FORTWEB_LEGACY_RUNTIME_DIR"];
+    test.skip(!legacyRoot, "FORTWEB_LEGACY_RUNTIME_DIR must identify the verified legacy runtime");
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    const legacy = await page.context().newPage();
+    await legacy.route("**/app/runtime/*.py", async (route) => {
+        const name = new URL(route.request().url()).pathname.split("/").pop()!;
+        const body = readFileSync(path.join(legacyRoot!, "app/runtime", name), "utf8");
+        await route.fulfill({ status: 200, contentType: "text/x-python", body });
+    });
+    const boot = async (tab: Page) => {
+        await tab.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+        await tab.waitForFunction(() => (
+            window as typeof window & { webbaserProductionHarnessReady?: boolean }
+        ).webbaserProductionHarnessReady === true);
+    };
+    const request = (tab: Page, method: string, params: Record<string, unknown> = {}) => tab.evaluate(
+        ({ method, params }) => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request(method, params), { method, params },
+    );
+    try {
+        await boot(legacy);
+        await boot(page);
+        const name = uniqueName("isolated");
+        const oldVault = await request(legacy, "vaults.create", { name, passcode: "" });
+        const vaultId = String((oldVault.vault as Record<string, unknown>).id);
+        await request(legacy, "vaults.open", { vaultId, passcode: "" });
+        const oldIdentity = await request(legacy, "identifiers.create", { vaultId, alias: "legacy" });
+        expect((await request(page, "vaults.list")).vaults).toEqual([]);
+
+        const protectedVault = await request(page, "vaults.create", { name, passcode: "" });
+        expect((protectedVault.vault as Record<string, unknown>).id).toBe(vaultId);
+        await request(page, "vaults.open", { vaultId, passcode: "" });
+        const protectedIdentity = await request(page, "identifiers.create", { vaultId, alias: "protected" });
+        const protectedAid = String((protectedIdentity.identifier as Record<string, unknown>).aid);
+        expect(protectedAid).not.toBe((oldIdentity.identifier as Record<string, unknown>).aid);
+        await request(legacy, "identifiers.create", { vaultId, alias: "legacy-second" });
+
+        for (const tab of [legacy, page]) await request(tab, "vaults.close", { vaultId });
+        for (const tab of [legacy, page]) await request(tab, "vaults.open", { vaultId, passcode: "" });
+        const aliases = async (tab: Page) => ((await request(tab, "identifiers.list", { vaultId })).identifiers as Array<Record<string, unknown>>)
+            .map((record) => record.alias).sort();
+        expect(await aliases(legacy)).toEqual(["legacy", "legacy-second"]);
+        expect(await aliases(page)).toEqual(["protected"]);
+        const exported = await request(page, "identifiers.export", { vaultId, aid: protectedAid });
+        writeFileSync(testInfo.outputPath("protected-kel.cesr"), Buffer.from(String(exported.cesr), "base64"));
+        writeFileSync(testInfo.outputPath("protected-kel.json"), JSON.stringify({ aid: protectedAid }));
+        for (const tab of [legacy, page]) await request(tab, "vaults.close", { vaultId });
+    } finally {
+        await legacy.close();
+    }
+});
+
+test("interrupted protected vault initialization does not silently reuse partial state", async ({ page, baseURL }) => {
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    await page.route("**/app/runtime/vaulting.py", async (route) => {
+        const response = await route.fetch();
+        const source = await response.text();
+        const close = '        await close_habery(temp_state["hby"], clear=False)';
+        expect(source).toContain(close);
+        await route.fulfill({ response, body: source.replace(close,
+            '        await temp_state["hby"].ks.aclose(clear=False)\n        raise RuntimeFault("BAD_STATE", "injected initialization failure")') });
+    });
+    const boot = async () => {
+        await page.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+        await page.waitForFunction(() => (
+            window as typeof window & { webbaserProductionHarnessReady?: boolean }
+        ).webbaserProductionHarnessReady === true);
+    };
+    const request = (method: string, params: Record<string, unknown> = {}) => page.evaluate(
+        ({ method, params }) => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request(method, params), { method, params },
+    );
+    const name = uniqueName("interrupted-init");
+    await boot();
+    await expect(request("vaults.create", { name, passcode: "" })).rejects.toThrow(/injected initialization failure/);
+    expect((await request("vaults.list")).vaults).toEqual([]);
+    await page.evaluate(() => (
+        window as typeof window & { webbaserProductionHarness: ProductionHarness }
+    ).webbaserProductionHarness.destroy());
+    await page.unroute("**/app/runtime/vaulting.py");
+    await boot();
+    await expect(request("vaults.create", { name, passcode: "" })).rejects.toThrow();
+    expect((await request("vaults.list")).vaults).toEqual([]);
+    await expect(request("vaults.open", { vaultId: name, passcode: "" })).rejects.toThrow(/not found/i);
+});
+
+for (const [condition, expression, error] of [
+    ["unavailable", "undefined", /locking is unavailable/],
+    ["rejected", "{request: () => Promise.reject(new Error('lock rejected'))}", /Runtime request failed/],
+] as const) {
+    test(`wallet storage fails closed when Web Locks are ${condition}`, async ({ page, baseURL }) => {
+        test.setTimeout(PHASE_TIMEOUT_MS);
+        await page.route("**/app/runtime/wallet-worker.py", async (route) => {
+            const response = await route.fetch();
+            const source = await response.text();
+            expect(source).toContain("import js\n");
+            await route.fulfill({
+                response,
+                body: source.replace("import js\n", `import js\njs.eval("Object.defineProperty(navigator, 'locks', {value: ${expression}})")\n`),
+            });
+        });
+        await page.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+        await page.waitForFunction(() => (
+            window as typeof window & { webbaserProductionHarnessReady?: boolean }
+        ).webbaserProductionHarnessReady === true);
+        await expect(page.evaluate(() => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request("vaults.create", { name: "unsupported", passcode: "" })))
+            .rejects.toThrow(error);
+    });
+}
+
+test("a worker stops using its vault when its lock request fails", async ({ page, baseURL }) => {
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    await page.route("**/app/runtime/wallet-worker.py", async (route) => {
+        const response = await route.fetch();
+        const source = await response.text();
+        const injection = "(() => { const real = navigator.locks; Object.defineProperty(navigator, 'locks', {value: {request: (...args) => Promise.race([real.request(...args), new Promise((_, reject) => setTimeout(() => reject(new Error('injected loss')), 1500))])}}) })()";
+        await route.fulfill({ response, body: source
+            .replace("import js\n", `import js\njs.eval("${injection}")\n`)
+            .replace('    "vaults.list",', '    "test.wait",\n    "vaults.list",')
+            .replace('    if method.startswith("kf."):', '    if method == "test.wait":\n        await asyncio.sleep(10)\n    if method.startswith("kf."):') });
+    });
+    await page.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+    await page.waitForFunction(() => (
+        window as typeof window & { webbaserProductionHarnessReady?: boolean }
+    ).webbaserProductionHarnessReady === true);
+    const request = (method: string, params: Record<string, unknown>) => page.evaluate(
+        ({ method, params }) => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request(method, params), { method, params },
+    );
+    const created = await request("vaults.create", { name: uniqueName("lost-lock"), passcode: "" });
+    const vaultId = String((created.vault as Record<string, unknown>).id);
+    await request("vaults.open", { vaultId, passcode: "" });
+    await expect(request("test.wait", { vaultId })).rejects.toThrow(/ownership was lost/);
+    await expect(request("identifiers.create", { vaultId, alias: "blocked" })).rejects.toThrow(/ownership was lost/);
+});
+
+test("cancelling lock acquisition does not leave a late writer", async ({ page, baseURL }) => {
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    const second = await page.context().newPage();
+    await page.route("**/app/runtime/wallet-worker.py", async (route) => {
+        const response = await route.fetch();
+        const source = await response.text();
+        const wait = "        done, _ = await asyncio.wait((granted, request), return_when=asyncio.FIRST_COMPLETED)";
+        expect(source).toContain(wait);
+        await route.fulfill({ response, body: source.replace(wait,
+            "        asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)\n" + wait) });
+    });
+    try {
+        for (const tab of [page, second]) {
+            await tab.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+            await tab.waitForFunction(() => (
+                window as typeof window & { webbaserProductionHarnessReady?: boolean }
+            ).webbaserProductionHarnessReady === true);
+        }
+        await page.evaluate(() => {
+            void (window as typeof window & { webbaserProductionHarness: ProductionHarness })
+                .webbaserProductionHarness.request("vaults.list", {}, 2000).catch(() => {});
+        });
+        await page.waitForTimeout(500);
+        const created = await second.evaluate((name) => (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness.request("vaults.create", { name, passcode: "" }), uniqueName("after-cancel"));
+        expect(created.vault).toBeTruthy();
+        await page.waitForTimeout(2000);
+        const held = await page.evaluate(async () => (await navigator.locks.query()).held ?? []);
+        expect(held.filter((lock) => lock.name === "@fortweb-v2/writer")).toHaveLength(0);
+    } finally {
+        await second.close();
+    }
+});
+
 test("a user can import a public identifier file into a browser vault", async ({ page, baseURL }) => {
     test.setTimeout(PHASE_TIMEOUT_MS);
     await page.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
