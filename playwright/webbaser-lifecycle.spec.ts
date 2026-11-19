@@ -880,6 +880,44 @@ test("legacy and protected workers keep fresh identities in separate storage", a
     }
 });
 
+test("reports an IndexedDB open failure without leaking its details", async ({ page, baseURL }) => {
+    test.setTimeout(PHASE_TIMEOUT_MS);
+    await page.route("**/app/runtime/wallet-worker.py", async (route) => {
+        const response = await route.fetch();
+        const source = await response.text();
+        const openStorage = 'await module.storage(f"@fortweb-v2/{namespace}")';
+        expect(source).toContain(openStorage);
+        await route.fulfill({
+            response,
+            body: source.replace(openStorage, 'await js.Promise.reject(js.Error.new("synthetic storage details"))'),
+        });
+    });
+    await page.goto(new URL(PRODUCTION_HARNESS_PATH, baseURL).toString());
+    await page.waitForFunction(() => (
+        window as typeof window & { webbaserProductionHarnessReady?: boolean }
+    ).webbaserProductionHarnessReady === true);
+
+    const outcome = await page.evaluate(async () => {
+        const harness = (
+            window as typeof window & { webbaserProductionHarness: ProductionHarness }
+        ).webbaserProductionHarness;
+        try {
+            await harness.request("vaults.list");
+            return null;
+        } catch (error) {
+            return error instanceof Error ? error.message : String(error);
+        }
+    });
+    expect(outcome).toContain("Runtime request failed.");
+    const diagnostics = await page.evaluate(() => (
+        window as typeof window & { webbaserProductionHarness: ProductionHarness }
+    ).webbaserProductionHarness.diagnostics());
+    expect(diagnostics.map(({ message }) => message)).toContainEqual(expect.stringMatching(
+        /event=worker_storage_open_failed .*level="error" .*error_class="JsException"/,
+    ));
+    expect(JSON.stringify(diagnostics)).not.toContain("synthetic storage details");
+});
+
 test("interrupted protected vault initialization does not silently reuse partial state", async ({ page, baseURL }) => {
     test.setTimeout(PHASE_TIMEOUT_MS);
     await page.route("**/app/runtime/vaulting.py", async (route) => {

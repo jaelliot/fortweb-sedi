@@ -283,10 +283,17 @@ class _WorkerStorage:
     async def sync(self):
         await self._handle.sync()
 
+    async def close(self):
+        await self._handle.close()
+
 
 async def _open_worker_storage(namespace):
     module = importlib.import_module("polyscript")
-    return _WorkerStorage(await module.storage(f"@fortweb-v2/{namespace}"))
+    try:
+        return _WorkerStorage(await module.storage(f"@fortweb-v2/{namespace}"))
+    except Exception as exc:
+        emit_runtime_diagnostic("worker_storage_open_failed", level="error", error_class=type(exc).__name__)
+        raise
 
 
 def _runtime_origin_contract():

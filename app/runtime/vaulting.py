@@ -348,7 +348,17 @@ def _vault_id_for_alias(alias: str, existing_ids: set[str]):
 async def _validate_open_kels(baser, modules, *, keeper=None):
     """Reject incomplete local histories before making a vault available."""
     habs = baser._stores["habs."]
-    persisted_habs = modules["webdbing"]._deserialize_records(habs.handle.get("__records__"))
+    handle = habs.handle
+    opened_here = handle is None
+    if opened_here:
+        handle = await baser._storageOpener(habs.namespace)
+    try:
+        persisted_habs = modules["webdbing"]._deserialize_records(handle.get("__records__"))
+    finally:
+        if opened_here:
+            close = getattr(handle, "close", None)
+            if close is not None:
+                await close()
     if dict(habs.items) != persisted_habs:
         # Browser reload removes orphaned habitat records; preserve them for recovery.
         habs.items.clear()
