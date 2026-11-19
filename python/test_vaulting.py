@@ -242,6 +242,46 @@ class IdentifierNamespaceTest(unittest.TestCase):
         self.assertEqual(exported, [public])
 
 
+class VaultSnapshotTest(unittest.IsolatedAsyncioTestCase):
+    async def test_validation_preserves_the_persisted_snapshot_with_or_without_a_retained_handle(self):
+        for retained in (True, False):
+            with self.subTest(retained=retained):
+                vaulting = _load_module()
+                opened = []
+                closed = []
+
+                async def close():
+                    closed.append(True)
+
+                handle = SimpleNamespace(get={"__records__": "snapshot"}.get, close=close)
+
+                async def open_storage(namespace):
+                    opened.append(namespace)
+                    return handle
+
+                store = SimpleNamespace(
+                    handle=handle if retained else None,
+                    namespace="wallet:habs.",
+                    items={},
+                    dirty=True,
+                )
+                baser = SimpleNamespace(_stores={"habs.": store}, _storageOpener=open_storage)
+                persisted = {b"orphaned": b"record"}
+
+                def deserialize(raw):
+                    self.assertEqual(raw, "snapshot")
+                    return persisted
+
+                modules = {"webdbing": SimpleNamespace(_deserialize_records=deserialize)}
+                with self.assertRaises(vaulting.RuntimeFault) as error:
+                    await vaulting._validate_open_kels(baser, modules)
+                self.assertEqual(error.exception.code, "BAD_STATE")
+                self.assertEqual(store.items, persisted)
+                self.assertFalse(store.dirty)
+                self.assertEqual(opened, [] if retained else ["wallet:habs."])
+                self.assertEqual(closed, [] if retained else [True])
+
+
 class VaultSetupTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.vaulting = _load_module()

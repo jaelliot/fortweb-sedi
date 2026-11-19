@@ -283,6 +283,9 @@ class _WorkerStorage:
     async def sync(self):
         await self._handle.sync()
 
+    async def close(self):
+        await self._handle.close()
+
 
 async def _open_worker_storage(namespace):
     module = importlib.import_module("polyscript")
