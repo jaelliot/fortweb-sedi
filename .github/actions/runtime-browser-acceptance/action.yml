@@ -113,7 +113,7 @@ runs:
         done
         test -s "$ready_file" || { cat "$server_log"; exit 1; }
         expect_browser_acdc=0
-        if [ "$FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256" = 'd00ad7c4dc2fcce08904562bb50dd2ace53cf226027d376b41e42cbb69410023' ]; then
+        if [ "$FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256" = 'f76cf23f5cdaa5fe3f7a0e264c862290f9c8b6be2aafca6622926e1869731431' ]; then
           expect_browser_acdc=1
         fi
         FORTWEB_BASE_URL=http://127.0.0.1:4175 \
