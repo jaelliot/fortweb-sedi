@@ -67,6 +67,73 @@ jobs:
         with:
           label: pull-request
 
+      - name: Check out the qualified Core SEDI reference
+        if: env.FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256 == 'f76cf23f5cdaa5fe3f7a0e264c862290f9c8b6be2aafca6622926e1869731431'
+        uses: actions/checkout@v4
+        with:
+          repository: WebOfTrust/keripy
+          ref: 84301a9ff4bbb644ce134f9649ad56b49aa130f2
+          path: build/core-sedi-reference
+          persist-credentials: false
+
+      - name: Set up native Python for Core SEDI
+        if: env.FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256 == 'f76cf23f5cdaa5fe3f7a0e264c862290f9c8b6be2aafca6622926e1869731431'
+        id: core-sedi-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          update-environment: false
+
+      - name: Install the native Core SEDI test dependencies
+        if: env.FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256 == 'f76cf23f5cdaa5fe3f7a0e264c862290f9c8b6be2aafca6622926e1869731431'
+        shell: bash
+        env:
+          NATIVE_PYTHON: ${{ steps.core-sedi-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$NATIVE_PYTHON" -m venv "$RUNNER_TEMP/fortweb-core-sedi"
+          native_python="$RUNNER_TEMP/fortweb-core-sedi/bin/python"
+          if ! "$native_python" -c 'from ctypes.util import find_library; assert find_library("sodium")'; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libsodium-dev
+          fi
+          "$native_python" -m pip install --disable-pip-version-check ./build/core-sedi-reference 'pytest==9.1.1'
+
+      - name: Run the qualified Core SEDI browser acceptance tests
+        if: env.FORTWEB_RUNTIME_SOURCE_MANIFEST_SHA256 == 'f76cf23f5cdaa5fe3f7a0e264c862290f9c8b6be2aafca6622926e1869731431'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready_file=test-results/core-sedi-ready.json
+          server_log=test-results/core-sedi-server.jsonl
+          python3 scripts/serve_runtime_browser.py \
+            --mode application --port 0 --ready-file "$ready_file" \
+            --inventory test-results/runtime-inventory.json > "$server_log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for ((attempt=0; attempt<100; attempt++)); do
+            test -s "$ready_file" && break
+            kill -0 "$server_pid" 2>/dev/null || { cat "$server_log"; exit 1; }
+            sleep 0.1
+          done
+          test -s "$ready_file" || { cat "$server_log"; exit 1; }
+          runtime_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$ready_file")
+          FORTWEB_BASE_URL="http://127.0.0.1:$runtime_port" \
+          FORTWEB_PLAYWRIGHT_OUTPUT_DIR=test-results/core-sedi \
+          FORTWEB_SEDI_REFERENCE="$GITHUB_WORKSPACE/build/core-sedi-reference" \
+          FORTWEB_SEDI_PYTHON="$RUNNER_TEMP/fortweb-core-sedi/bin/python" \
+          FORTWEB_EXPECT_REGISTRY_BACKEND=1 \
+          FORTWEB_EXPECT_SEDI_COMPAT=1 \
+          FORTWEB_TEST_STRICT_CSP=1 \
+            npx playwright test --config=playwright.runtime.config.ts \
+              playwright/sedi-core-preflight.spec.ts playwright/sedi-core-interop.spec.ts \
+              playwright/sedi-core-browser-verifier.spec.ts playwright/sedi-core-failure.spec.ts \
+              playwright/sedi-compactor.spec.ts
+
       - name: Upload Playwright artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
