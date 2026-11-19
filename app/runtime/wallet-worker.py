@@ -54,6 +54,15 @@ ALLOWED_METHODS = {
     "credentials.issueSigned",
     "credentials.issueRegistered",
     "credentials.getIssued",
+    "credentials.revokeRegistered",
+    "credentials.receive",
+    "credentials.getReceived",
+    "ipex.grant",
+    "ipex.receive",
+    "ipex.admit",
+    "ipex.present",
+    "ipex.verifyPresentation",
+    "ipex.get",
     "remotes.list",
     "remotes.get",
     "remotes.import",
@@ -453,6 +462,7 @@ vaulting.configure_runtime(
     passcode_kdf_defaults=PASSCODE_KDF_DEFAULTS,
     default_settings=DEFAULT_SETTINGS,
     kf_state_subdb=KF_STATE_SUBDB,
+    allow_synthetic_receipt=_config_dict().get("fort_synthetic_recipient_testing") is True,
 )
 transporting.configure_runtime(
     origin=_origin,
